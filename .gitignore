@@ -1,0 +1,6 @@
+Files/
+*.fits
+*.psf.fits
+*.plantList
+*.png
+.DS_Store
