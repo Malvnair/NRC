@@ -1,0 +1,58 @@
+from astropy.io import fits
+
+# test both fk files
+files = [
+    "/arc/projects/classy/dbimages/2773118/fk2773118p.fits",
+    "/arc/projects/classy/dbimages/2773082/ccd15/fk2773082s15.fits"
+]
+
+for fn in files:
+
+    print("\n" + "="*60)
+    print("FILE:", fn)
+
+    with fits.open(fn) as hdul:
+
+        # print FITS structure
+        hdul.info()
+
+        print("\nnumber of HDUs =", len(hdul))
+
+        # try some indices
+        test_indices = [0, 1, 15, 16]
+
+        for idx in test_indices:
+
+            try:
+                hdu = hdul[idx]
+
+                print(f"\nhdul[{idx}] exists")
+
+                if hdu.data is None:
+                    print("data = None")
+
+                else:
+                    print("shape =", hdu.data.shape)
+                    print("dtype =", hdu.data.dtype)
+
+            except Exception as e:
+                print(f"\nhdul[{idx}] does NOT exist")
+                print("error =", e)
+
+        for i, hdu in enumerate(hdul):
+
+            print(f"\nHDU {i}")
+            print("type =", type(hdu))
+
+            print("\nHEADER:")
+            print(repr(hdu.header))
+
+            if hdu.data is None:
+                print("\nDATA = None")
+
+            else:
+                print("\nDATA SHAPE =", hdu.data.shape)
+                print("DATA TYPE  =", hdu.data.dtype)
+
+                print("\nFULL DATA ARRAY:")
+                print(hdu.data)
