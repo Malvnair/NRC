@@ -22,24 +22,16 @@ from pathlib import Path
 
 # User input
 
-SEQ_DIR = input("Enter sequence directory: ")
-REF_ID = input("Enter reference ID (def=2773118): ")
+INPUT_PATH = input("Enter sequence directory or FITS file: ")
 CCD = input("Enter CCD number (def=15): ")
 N_FRAMES = input("Enter number of frames (def=10): ")
 HALF_SIZE = input("Enter cutout size (def=100): ")
-PSF_FILE = input(
-    "Enter PSF file "
-    "(def=2773118p15.psf.fits): "
-)
 
 
 # default to test
 
-if SEQ_DIR == "":
-    SEQ_DIR = "/arc/projects/classy/warps/2022-08-01-AS1_July/15"
-
-if REF_ID == "":
-    REF_ID = "2773118"
+if INPUT_PATH == "":
+    INPUT_PATH = "/arc/projects/classy/dbimages/2773118/fk2773118p.fits"
 
 if CCD == "":
     CCD = 15
@@ -56,22 +48,16 @@ if HALF_SIZE == "":
 else:
     HALF_SIZE = int(HALF_SIZE)
     
-if PSF_FILE == "":
-    PSF_FILE = (
-        "/arc/projects/classy/dbimages/"
-        "2773118/ccd15/2773118p15.psf.fits"
-    )
 
+INPUT_PATH = Path(INPUT_PATH)
 
-SEQ_DIR = Path(SEQ_DIR)
-PSF_FILE = Path(PSF_FILE)
 
 
 
 
 # SWITCH SETTTINGS!
 
-MODE = "real"             # real or fake
+MODE = "fake"             # real or fake
 
 
 
@@ -93,16 +79,88 @@ PLANT_COLS = [
 
 
 
-#find all the fits files with the matching pattern and return
-fits_files = sorted(
-    SEQ_DIR.glob(f"DIFFEXP-*-{REF_ID}-{CCD}.fits")
-)
+# gets matching plantlist filename
+def get_plant_file(fits_file, CCD):
 
-#in case you cant find any
-if len(fits_files) == 0:
-    sys.exit(
-        f"No DIFFEXP files found for REF_ID={REF_ID}, CCD={CCD}"
+    name = fits_file.stem
+
+    if name.startswith("DIFFEXP"):
+
+        # DIFFEXP-2773082-2773118-15.fits
+        parts = name.split("-")
+
+        image_id = parts[1]
+        ref_id = parts[2]
+        CCD = int(parts[3])
+
+        plant_file = (
+            fits_file.parent /
+            f"{image_id}p{CCD}-{ref_id}p{CCD}.plantList"
+        )
+
+    else:
+
+        # fk2773118p.fits or 2773118p.fits
+        image_id = (
+            name
+            .replace("fk", "")
+            .replace("p", "")
+        )
+
+        plant_file = (
+            fits_file.parent /
+            f"ccd{CCD}" /
+            f"{image_id}p{CCD}.plantList"
+        )
+
+    return plant_file, image_id, CCD
+
+
+
+# gets matching psf filename
+def get_psf_file(fits_file, CCD):
+
+    name = fits_file.stem
+
+    if name.startswith("DIFFEXP"):
+
+        # DIFFEXP-2773082-2773118-15.fits
+        parts = name.split("-")
+
+        image_id = parts[1]
+        CCD = int(parts[3])
+
+    else:
+
+        # fk2773118p.fits or 2773118p.fits
+        image_id = (
+            name
+            .replace("fk", "")
+            .replace("p", "")
+        )
+
+    psf_file = (
+        Path("/arc/projects/classy/dbimages") /
+        image_id /
+        f"ccd{CCD}" /
+        f"{image_id}p{CCD}.psf.fits"
     )
+
+    return psf_file
+
+
+
+#find all the fits files with the matching pattern and return
+if INPUT_PATH.is_file():
+
+    fits_files = [INPUT_PATH]
+
+else:
+
+    fits_files = sorted(
+        INPUT_PATH.glob(f"DIFFEXP-*-{ref_id}-{CCD}.fits")
+    )
+
 
 # only take user input of files
 fits_files = fits_files[:N_FRAMES]
@@ -115,38 +173,63 @@ images = []
 mjds = []
 plant_tables = []
 image_ids = []
+exptimes = []
+psf_files = []
 
 
 
 for fits_file in fits_files:
     
-    # split up the name!
-    name = fits_file.stem
-    parts = name.split("-")
-
-   
-    image_id = parts[1]
+    plant_file, image_id, CCD = get_plant_file(fits_file, CCD)
     image_ids.append(image_id)
-
-    # gets matching plantlist filename
-    plant_file = SEQ_DIR / f"{image_id}p{CCD}-{REF_ID}p{CCD}.plantList"
+    
+    psf_file = get_psf_file(fits_file, CCD)
 
     if not plant_file.exists():
-        sys.exit(f"Missing plantList")
+        sys.exit(f"Missing plantList: {plant_file}")
+
+    if not psf_file.exists():
+        sys.exit(f"Missing PSF file: {psf_file}")
 
     print(f"\nFITS = {fits_file.name}")
-    print(f"plantList = {plant_file.name}")
+    print(f"plantList = {plant_file}")
+    print(f"PSF = {psf_file}")
 
     with fits.open(fits_file) as hdul:
+
+        name = fits_file.stem
+
+        if name.startswith("DIFFEXP"):
+
+            # DIFFEXP files have image data in HDU 1
+            hdu_used = 1
+
+        else:
+
+            # fk dbimages have image data in HDU 0
+            # full fk mosaic files have PRIMARY in HDU 0, so CCD 15 is HDU 16
+            # non-fk dbimage mosaic files are handled the same as fk mosaic files
+            hdu_used = CCD + 1
+
         # get image array and convert to float
-        image = hdul[1].data.astype(float)
-        EXPTIME = hdul[0].header["EXPTIME"]
+        image = hdul[hdu_used].data.astype(float)
+
+        if "EXPTIME" in hdul[0].header:
+            EXPTIME = hdul[0].header["EXPTIME"]
+        elif "EXPTIME" in hdul[hdu_used].header:
+            EXPTIME = hdul[hdu_used].header["EXPTIME"]
+        else:
+            EXPTIME = np.nan
+            print("No EXPTIME found")
         
         # cent_time = MJD-OBS + exptime/2./(3600.*24.)
 
         if "MJD-OBS" in hdul[0].header:
             # read modified julian date
             mjd = float(hdul[0].header["MJD-OBS"])
+        elif "MJD-OBS" in hdul[hdu_used].header:
+            # read modified julian date
+            mjd = float(hdul[hdu_used].header["MJD-OBS"])
         else:
             mjd = np.nan
             print("No MJD-OBS found")
@@ -165,7 +248,10 @@ for fits_file in fits_files:
     images.append(image)
     mjds.append(mjd)
     plant_tables.append(df)
+    exptimes.append(EXPTIME)
+    psf_files.append(psf_file)
 
+    print(f"HDU = {hdu_used}")
     print(f"Image shape = {image.shape}")
     print(f"MJD = {mjd}")
     print(f"Objects = {len(df)}")
@@ -173,7 +259,7 @@ for fits_file in fits_files:
 # is any nan?
 for i in range(len(mjds)):
     if np.isnan(mjds[i]):
-        print(f"MJD-OBS missing in frames {bad}")
+        print(f"MJD-OBS missing in frame {i}")
 
 
 
@@ -328,6 +414,8 @@ for i in range(len(images)):
     image = images[i]
     df = plant_tables[i]
     mjd = mjds[i]
+    EXPTIME = exptimes[i]
+    psf_file = psf_files[i]
 
     plant_row = df[df["index"] == obj_index].iloc[0]
     x_plant = plant_row["x"]
@@ -350,7 +438,7 @@ for i in range(len(images)):
         x = x_start + dx_expected
         y = y_start + dy_expected
 
-        image = inject_fake(image,x,y,chosen["rate"],chosen["angle"],EXPTIME,PSF_FILE)
+        image = inject_fake(image,x,y,chosen["rate"],chosen["angle"],EXPTIME,psf_file)
 
     else:
         sys.exit("MODE must be real or fake")
@@ -424,7 +512,7 @@ print(f"Saved tensor: {out_npz}")
 n = tensor.shape[0]
 
 cols = 5
-rows = int(np.round(n / cols))
+rows = int(np.ceil(n / cols))
 
 vmin = np.percentile(tensor, 1)
 vmax = np.percentile(tensor, 99)
