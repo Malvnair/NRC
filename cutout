@@ -22,14 +22,16 @@ else:
     HALF_SIZE = int(HALF_SIZE)
 
 if FITS_FILE == "":
-    FITS_FILE = "/arc/projects/classy/warps/2022-08-01-AS1_July/15/DIFFEXP-2773082-2773118-15.fits"
+    FITS_FILE = "/arc/projects/classy/dbimages/2773118/fk2773118p.fits"
 
 if PLANT_FILE == "":
-    PLANT_FILE = "/arc/projects/classy/warps/2022-08-01-AS1_July/15/2773082p15-2773118p15.plantList"
-
-
-
-
+    PLANT_FILE = "/arc/projects/classy/dbimages/2773118/ccd15/2773118p15.plantList"    
+    
+    
+    
+    
+    
+    
 #########
 # open the fits file and read the image and header
 fits_path = Path(FITS_FILE)
@@ -37,29 +39,58 @@ if not fits_path.exists():
     sys.exit("FITS file not found.")
 
 with fits.open(fits_path) as hdul:
-    hdul.info()
-    print()
+    #hdul.info()
+    #print()
 
     # DIFFEXP files have image data in HDU 1
     # fk dbimages have image data in HDU 0
+    # full fk mosaic files have PRIMARY in HDU 0, so CCD 15 is HDU 16
     #  loop fiinds the first HDU that actually contains image datas
     image = None
     header = None
     hdu_used = None 
 
-    # proper index!!!
-    for i, hdu in enumerate(hdul):
-        if hdu.data is not None:
-            image = hdu.data
-            header = hdu.header
-            hdu_used = i
-            break
+    name = Path(FITS_FILE).stem
+
+    if name.startswith("DIFFEXP"):
+        # DIFFEXP-2773082-2773118-15.fits
+        # DIFFEXP image data is usually in HDU 1
+        hdu_used = 1
+
+        image = hdul[hdu_used].data
+        header = hdul[hdu_used].header
+
+    elif name.startswith("fk"):
+        # fk2773118p.fits is a full mosaic file
+        # get CCD number from the plantList name
+        plant_name = Path(PLANT_FILE).stem
+
+        # example: 2773118p15.plantList
+
+        CCD = int(plant_name.split("p")[-1])
+
+        # proper index!!!
+        # if HDU 0 is PRIMARY, then CCD 15 is HDU 16
+        hdu_used = CCD + 1
+
+        image = hdul[hdu_used].data
+        header = hdul[hdu_used].header
+    else:
+        # proper index!!!
+        for i, hdu in enumerate(hdul):
+            if hdu.data is not None:
+                image = hdu.data
+                header = hdu.header
+                hdu_used = i
+                break
 
     if image is None:
         sys.exit("No image data found")
 
+    image = image.astype(np.float32)
+    
 height, width = image.shape
-print(f"Image shape: {image.shape}")
+
 
 
 # read the plant list
@@ -114,14 +145,14 @@ row = safe_sorted.iloc[0]
 
 # print selected object info
 obj_index = int(row['index'])
-obj_x     = row['x']
-obj_y     = row['y']
-obj_mag   = row['mag']
-obj_rate  = row['rate']
+obj_x = row['x']
+obj_y = row['y']
+obj_mag = row['mag']
+obj_rate = row['rate']
 obj_angle = row['angle']
-obj_rra   = row['rate_ra']
-obj_rdec  = row['rate_dec']
-obj_amp   = row['psf_amp']
+obj_rra = row['rate_ra']
+obj_rdec = row['rate_dec']
+obj_amp = row['psf_amp']
 
 print("\nSelected object:")
 print(f"index = {obj_index}")
@@ -210,18 +241,32 @@ if name.startswith("DIFFEXP"):
     outfile = f"DIFFEXP_{image_id}_{ref_id}_CCD{ccd_id}_OBJ{obj_index}.png"
 
 elif name.startswith("fk"):
-    # fk2773082p15.fits
+    # fk2773118p.fits
     fk_info = name.replace("fk", "")
-    image_id, ccd_id = fk_info.split("p")
+
+    if fk_info.endswith("p"):
+        image_id = fk_info.replace("p", "")
+        ccd_id = str(hdu_used - 1)
+    else:
+        image_id, ccd_id = fk_info.split("p")
 
     # title with info from file
     title = (
-        f"FK {image_id} | CCD {ccd_id} | Object {obj_index}\n"
+        f"FK {image_id} | CCD {ccd_id} | HDU {hdu_used} | Object {obj_index}\n"
         f"x={obj_x:.1f}  y={obj_y:.1f}  "
         f"Rate={obj_rate:.2f}\"/hr  Angle={obj_angle:.1f}°"
     )
 
-    outfile = f"FK_{image_id}_CCD{ccd_id}_OBJ{obj_index}.png"
+    outfile = f"FK_{image_id}_CCD{ccd_id}_HDU{hdu_used}_OBJ{obj_index}.png"
+
+else:
+    title = (
+        f"Image HDU {hdu_used} | Object {obj_index}\n"
+        f"x={obj_x:.1f}  y={obj_y:.1f}  "
+        f"Rate={obj_rate:.2f}\"/hr  Angle={obj_angle:.1f}°"
+    )
+
+    outfile = f"IMAGE_HDU{hdu_used}_OBJ{obj_index}.png"
 
 
 ax.set_title(title)
