@@ -1,5 +1,7 @@
 """
-maketensor6.py
+maketensor7.py
+
+Negative wells edition.
 
 TNO tensor generator for the CLASSY survey.
 
@@ -59,7 +61,15 @@ def find_psf_file_from_dbimages(image_id, ccd):
 
 
 
-
+def project_track_position(wcs_obj, pixel_scale, ra_ref, dec_ref, motion, dt_hr):
+    """Calculate where the fake object/residual should be on a fram"""
+    x_ref_arr, y_ref_arr = wcs_obj.all_world2pix([ra_ref], [dec_ref], 0)
+    x_ref = float(x_ref_arr[0])
+    y_ref = float(y_ref_arr[0])
+    dx_pix =  motion["rate_ra"]  * dt_hr / pixel_scale
+    dy_pix = -motion["rate_dec"] * dt_hr / pixel_scale
+    # predicted pixel position
+    return x_ref + dx_pix, y_ref + dy_pix
 
 
 ####################
@@ -85,7 +95,7 @@ def parse_args():
     parser.add_argument("--ccd", type=int,  help="CCD number")
     # number of fake tnos
     parser.add_argument("--num-samples", type=int,  help="Number of fake TNOs to generate")
-    parser.add_argument("--n-frames", type=int,  help="Max frames to load")
+    parser.add_argument("--n-frames", type=int,  help="Max science frames to load")
     parser.add_argument("--half-size", type=int,  help="Cutout half-size in pixels")
     parser.add_argument("--out-dir", type=str,  help="Output directory")
     # JSON config
@@ -111,6 +121,8 @@ def parse_args():
         "sort_by_time":True,
         "debug_fake_only": False,
         "save_plots":False,
+        # negative wells 
+        "add_noise_to_negative_wells": False, 
     }
 
     # JSON file stuff
@@ -143,12 +155,12 @@ def parse_args():
 
 ###############
 # WarpDataset
-# Loads an ordered sequence of warp FITS files for one visit/CCD.
+# Loads an ordered sequence of science warp FITS files for one visit/CCD.
 ####################
 
 class WarpDataset:
     """
-    Reads the visit list, finds matching DIFFEXP FITS files, and loads
+    Reads the science visit list, finds matching DIFFEXP FITS files, and loads
     everything into memory: images, WCS, zeropoints, gains, MJDs, exptimes.
     """
 
@@ -353,6 +365,125 @@ class WarpDataset:
             return 0.185  # MegaCam pixel scale
 
 
+###############
+# TemplateDataset
+# Loads the images that built the subtraction template for one visit/CCD.
+####################
+
+class TemplateDataset:
+    """
+    Reads the *template* visit list
+
+        /arc/projects/classy/visitLists/<visit>/<visit>_template_visit_list.txt
+    """
+
+    def __init__(self, visit, ccd):
+        self.visit = visit
+        self.ccd = ccd
+
+        self.image_ids = []
+        self.fits_files = []
+        self.psf_files = []
+        self.wcs_list = []
+        self.cent_times = []
+        self.mjds = []
+        self.exptimes = []
+        self.zeropoints = []
+        self.gains = []
+        self.pixel_scales = []
+
+    def load(self):
+        """Read the template list, match + open each FITS, fill all lists."""
+        template_ids = self._read_template_list()
+
+        warp_dir = WARP_ROOT / self.visit / str(self.ccd)
+        if not warp_dir.is_dir():
+            sys.exit(f"Warp directory not found: {warp_dir}")
+
+        for tmpl_id in template_ids:
+            # prefer a matching DIFFEXP in the same warp directory
+            matches = sorted(
+                warp_dir.glob(f"DIFFEXP-{tmpl_id}-*-{self.ccd}.fits")
+            )
+            if len(matches) == 0:
+                print(f"skipping.")
+                continue
+            if len(matches) > 1:
+                print(f"too many")
+            fits_file = matches[0]
+
+            # we need a PSF to render this template's negative well
+            psf_path = find_psf_file_from_dbimages(tmpl_id, self.ccd)
+            if psf_path is None:
+                print(f"No PSF")
+                continue
+
+            self._load_one(fits_file, tmpl_id, psf_path)
+
+        if not self.image_ids:
+            sys.exit("No loaded.")
+        for i, tid in enumerate(self.image_ids):
+            print(f"  T[{i}] id={tid}  zp={self.zeropoints[i]:.4f}  "
+                  f"exptime={self.exptimes[i]:.1f}s  mjd={self.mjds[i]:.6f}  "
+                  f"psf={self.psf_files[i].name}")
+        return self
+
+    def _read_template_list(self):
+        """Read template image IDs from the template visit list."""
+        path = (VISIT_LIST_ROOT / self.visit /
+                f"{self.visit}_template_visit_list.txt")
+        if not path.exists():
+            sys.exit(f"Template visit list not found: {path}")
+
+        ids = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    ids.append(line)
+
+        if not ids:
+            sys.exit("Template visit list is empty.")
+        return ids
+
+    def _load_one(self, fits_file, image_id, psf_path):
+        """Open one template FITS and append its metadata to all lists."""
+        # reuse the science loaders' static helpers; we only need metadata,
+        # not the template pixels themselves.
+        with fits.open(fits_file) as hdul:
+            _image, img_hdu = WarpDataset._find_image_hdu(hdul)
+
+            img_header = img_hdu.header
+            wcs_obj = WarpDataset._build_wcs(img_header)
+            zp = PhotoCalib.get_zeropoint(hdul)
+            gain = float(img_header.get("GAIN") or 3.0)
+
+            primary = hdul[0].header
+            exptime = float(primary.get("EXPTIME") or
+                            img_header.get("EXPTIME") or 0.0)
+            if "MJD-OBS" in primary:
+                mjd = float(primary["MJD-OBS"])
+            elif "MJD-OBS" in img_header:
+                mjd = float(img_header["MJD-OBS"])
+            else:
+                print(f"no MJD-OBS found in {fits_file.name}")
+                mjd = 0.0
+
+            cent_time = mjd + exptime / (2.0 * 86400.0)
+            pscale = WarpDataset._pixel_scale(wcs_obj)
+
+        self.image_ids.append(image_id)
+        self.fits_files.append(fits_file)
+        self.psf_files.append(psf_path)
+        self.wcs_list.append(wcs_obj)
+        self.cent_times.append(cent_time)
+        self.mjds.append(mjd)
+        self.exptimes.append(exptime)
+        self.zeropoints.append(zp)
+        self.gains.append(gain)
+        self.pixel_scales.append(pscale)
+
+
 # PhotoCalib
 # Handles zeropoint reading and magnitude→count conversion.
 
@@ -415,8 +546,8 @@ class OrbitSampler:
     """
 
     # Classical KBO values
-    R_MIN = 30.0   # Neptune (AU)
-    R_MAX = 50.0   # Kuiper belt edge 
+    R_MIN = 10.0   # Neptune (AU)
+    R_MAX = 20.0   # Kuiper belt edge 
     E_MAX = 0.25
     I_MAX_DEG = 35.0  # degrees
 
@@ -461,7 +592,6 @@ class MotionModel:
     @staticmethod
     def compute(orbit):
         """
-        orbit: dict from OrbitSampler.sample()
         Returns dict with rate_ra, rate_dec, rate, angle.
         """
         r = orbit["r"]
@@ -530,15 +660,15 @@ class MagnitudeSampler:
 
 class PositionSampler:
     """
-    Randomly draws a sky position with RA and Dec that isaway from all image edges in every frame
-    
-    The referrence position is fixed at frame 0's pixel grid.  The same
-    (RA, Dec) is projected onto each frame via that frams WCS.
-    
+    Randomly draws a cutout centre (away from all image edges in every frame)
+    and a random object position anywhere inside the frame-0
+    cutout. The cutout centre is fixed at frame 0's pixel grid.
     """
 
     # try multiple times before give up
     MAX_TRIES = 50
+    # keep the frame-0 object at least this fraction of half_size inside the cutout edge
+    EDGE_PAD_FRAC = 0.1
 
     def __init__(self, dataset, half_size, rng=None):
         self.dataset = dataset
@@ -548,29 +678,41 @@ class PositionSampler:
     # choose one safe random injection position
     def sample(self):
         """
-        Returns (ra, dec, x0, y0) or raises error.
+        Returns (ra_ref, dec_ref, x_cut, y_cut) or raises error.
+
+        (x_cut, y_cut) is the cutout centre in frame 0 (edge-safe in all frames).
+        (ra_ref, dec_ref) is the object reference, randomly offset from the
+        cutout centre so it can sit anywhere inside the frame-0 cutout.
         """
         # get first image, get wcs solution, get h and w in pixels
         img0 = self.dataset.images[0]
         wcs0 = self.dataset.wcs_list[0]
         h, w = img0.shape
         margin = self.half_size
+        # how far the object can sit from the cutout centre and stay inside it
+        max_off = self.half_size - int(round(self.half_size * self.EDGE_PAD_FRAC))
 
         for _ in range(self.MAX_TRIES):
-            # random pixel in frame 0 well away from edges
-            px = self.rng.uniform(margin, w - margin)
-            py = self.rng.uniform(margin, h - margin)
+            # random cutout centre in frame 0, full cutout away from edges
+            cx = self.rng.uniform(margin, w - margin)
+            cy = self.rng.uniform(margin, h - margin)
 
-            # convert to sky coordinates
-            ra_arr, dec_arr = wcs0.all_pix2world([px], [py], 0)
+            # the cutout window must be edge-safe in every frame
+            ra_c_arr, dec_c_arr = wcs0.all_pix2world([cx], [cy], 0)
+            if not self._safe_in_all_frames(float(ra_c_arr[0]), float(dec_c_arr[0])):
+                continue
+
+            # random object position anywhere inside the frame-0 cutout
+            ox = self.rng.uniform(-max_off, max_off)
+            oy = self.rng.uniform(-max_off, max_off)
+            x_obj = cx + ox
+            y_obj = cy + oy
+
+            ra_arr, dec_arr = wcs0.all_pix2world([x_obj], [y_obj], 0)
             ra  = float(ra_arr[0])
             dec = float(dec_arr[0])
 
-            # verify all frames can accommodate a full cutout at this sky pos
-            if not self._safe_in_all_frames(ra, dec):
-                continue
-
-            return ra, dec, float(px), float(py)
+            return ra, dec, float(cx), float(cy)
 
         raise RuntimeError(
             f"Could not find a safe position ")
@@ -599,29 +741,20 @@ class PSFInjector:
     Injects trippy trailed fake sources into images.
     """
 
-    def inject(self, image, x, y, rate, motion_rate_ra, motion_rate_dec,
-               mag, exptime, zeropoint, gain, pixel_scale, psf_file,
-               debug_fake_only=False):
-
+    # build the trailed line PSF once per frame, reuse it for every well
+    def build_line_psf(self, psf_file, rate, motion_rate_ra, motion_rate_dec,
+                       exptime, pixel_scale):
         psf_file = Path(psf_file)
         if not psf_file.exists():
             sys.exit(
                 f"PSF file not found,")
-
-        # real image copy, or zeroed for debug mode
-        if debug_fake_only:
-            background = np.zeros_like(image, dtype=float)
-        else:
-            background = image.copy().astype(float)
-
-        A, B = image.shape   # image dimensions
 
         # restore PSF fresh each call
         mpsf = trippy_psf.modelPSF(restore=str(psf_file))
         r2d = 180.0 / np.pi
         # Convert ra/dec motion to pixel angle
         trippy_angle = np.arctan2(-motion_rate_dec, motion_rate_ra) * r2d + 180.0
-        
+
         if trippy_angle>90:
             trippy_angle -= 180
         if trippy_angle<-90:
@@ -634,13 +767,18 @@ class PSFInjector:
             pixScale=pixel_scale,
             useLookupTable=True,
         )
+        return mpsf
+    # this is the make_psf_stamp_or_image you asked for. amplitude can be < 0.
+    def make_psf_image(self, image_shape, x, y, counts, mpsf, gain,
+                       add_poisson_noise):
+        A, B = image_shape
 
         # plant at unit amplitude on a blank canvas
         p_im = mpsf.plant(
             np.array([x]),
             np.array([y]),
             np.array([1.0]),
-            np.zeros_like(background),
+            np.zeros(image_shape, dtype=float),
             useLinePSF=True,
             returnModel=True,
             gain=1.0,
@@ -650,19 +788,72 @@ class PSFInjector:
         norm_flux = np.sum(p_im)
         if norm_flux <= 0:
             print("PSF plant returned zeroflux")
-            return background, 0.0
+            return np.zeros(image_shape, dtype=float), 0.0
 
-        amp = PhotoCalib.mag_to_counts(mag, zeropoint) / norm_flux
-        # Scale fake source
-        p_im *= amp
-        
-        # Poission random noise
-        p_im += np.random.randn(A, B) * np.sqrt(np.abs(p_im) / float(gain))
+        # counts signed: amp inherits the sign for negative wells
+        amp = counts / norm_flux
+        p_im = p_im * amp
+        if add_poisson_noise:
+            p_im += np.random.randn(A, B) * np.sqrt(np.abs(p_im) / float(gain))
 
+        return p_im, float(np.sum(p_im))
+
+    def inject(self, image, x, y, rate, motion_rate_ra, motion_rate_dec,
+               mag, exptime, zeropoint, gain, pixel_scale, psf_file,
+               debug_fake_only=False,
+               negative_wells=None,
+               add_noise_to_negative_wells=False):
+        """
+        Build the full fake DIFFEXP contribution for one science frame:
+        a positive source from mag/zeropoint using THIS frame's PSF, PLUS the
+        negative template wells in `negative_wells`. Each well carries its own
+        template PSF file / exptime / pixel scale, so the negative residual is
+        rendered with the template image's PSF, not the science frame's.
+
+        Each well is a dict:
+            {"x", "y", "counts", "psf_file", "exptime", "pixel_scale", "image_id"}
+        """
+        # real image copy, or zeroed for debug mode
+        if debug_fake_only:
+            background = np.zeros_like(image, dtype=float)
+        else:
+            background = image.copy().astype(float)
+
+        # positive source uses the SCIENCE frame PSF
+        sci_mpsf = self.build_line_psf(
+            psf_file, rate, motion_rate_ra, motion_rate_dec, exptime, pixel_scale
+        )
+
+        # positive source: counts from the magnitude/zeropoint as before
+        pos_counts = PhotoCalib.mag_to_counts(mag, zeropoint)
+        p_im, pos_flux = self.make_psf_image(
+            image.shape, x, y, pos_counts, sci_mpsf, gain,
+            add_poisson_noise=True,
+        )
         new_image = background + p_im
-        return new_image, float(np.sum(p_im))
 
+        # negative wells: each template's contribution, with its OWN PSF.
+        if negative_wells:
+            for well in negative_wells:
+                well_mpsf = self.build_line_psf(
+                    well["psf_file"], rate, motion_rate_ra, motion_rate_dec,
+                    well["exptime"], well["pixel_scale"],
+                )
+                w_im, _w_flux = self.make_psf_image(
+                    image.shape, well["x"], well["y"], well["counts"],
+                    well_mpsf, gain,
+                    add_poisson_noise=add_noise_to_negative_wells,
+                )
+                new_image = new_image + w_im
 
+        return new_image, float(pos_flux)
+    
+    
+    
+    
+    
+    
+    
 ###############
 # TensorBuilder
 # Extracts cutouts, builds the tensor, saves .npz.
@@ -719,8 +910,8 @@ class DiagnosticPlotter:
         self.half_size = half_size
 
     def save(self, out_path, tensor, positions, x_ref, y_ref,
-             image_ids, cent_times, title_info):
- 
+             image_ids, cent_times, title_info, negative_positions=None):
+        
         n = tensor.shape[0]
         hs = self.half_size
         vmin = np.nanpercentile(tensor, 1)
@@ -818,17 +1009,19 @@ class SyntheticTNOPipeline:
     """
     Main pipeline.
 
-    1. Load the warp dataset once.
-    2. For each sample:
+    1. Load the science warp dataset once.
+    2. Load the template dataset once (the real subtraction-template images).
+    3. For each sample:
        a. Sample orbit (OrbitSampler)
        b. Compute motion (MotionModel)
        c. Sample magnitude (MagnitudeSampler)
        d. Sample safe injection position (PositionSampler)
-       e. Inject fake TNO into each frame (PSFInjector)
+       e. Inject fake TNO into each science frame (PSFInjector), with negative
+          wells from the template images
        f. Build tensor (TensorBuilder)
        g. Save .npz (TensorBuilder.save)
        h. Save diagnostic plot (DiagnosticPlotter)
-    3. Print a summary.
+    4. Print a summary.
     """
 
     def __init__(self, cfg):
@@ -846,6 +1039,12 @@ class SyntheticTNOPipeline:
             sort_by_time = cfg["sort_by_time"],
         )
 
+        # the real subtraction-template images (separate visit list)
+        self.template_dataset = TemplateDataset(
+            visit = cfg["visit"],
+            ccd = cfg["ccd"],
+        )
+
         # mAKE PSF shaped 
         self.psf_injector = PSFInjector()
         # Object that randomly samples fake 
@@ -858,6 +1057,7 @@ class SyntheticTNOPipeline:
 
     def run(self):
         self.dataset.load()
+        self.template_dataset.load()
 
         # creates position sampler
         self.pos_sampler = PositionSampler(
@@ -909,11 +1109,14 @@ class SyntheticTNOPipeline:
         ra_ref, dec_ref, x_ref, y_ref = self.pos_sampler.sample()
 
         dataset = self.dataset
+        tmpl = self.template_dataset
+        n_tmpl = len(tmpl.image_ids)
 
         # inject into every frame
         injected_images = []
         injection_positions = []
         injected_fluxes = []
+        negative_positions = []   # per science-frame list of (x,y) well positions
         
         
         # midpoint to be used for first exposire
@@ -942,8 +1145,24 @@ class SyntheticTNOPipeline:
             if frame_psf is None:
                 sys.exit(
                     f"No PSF found for image_id")
-                
-                
+
+            negative_wells = []
+            for j in range(n_tmpl):
+                dt_j = (tmpl.cent_times[j] - cent_time0) * HOURS_PER_DAY
+                xj, yj = project_track_position(
+                    wcs_i, pscale, ra_ref, dec_ref, motion, dt_j
+                )
+                A_j = PhotoCalib.mag_to_counts(mag, tmpl.zeropoints[j])
+                negative_wells.append({
+                    "x":           xj,
+                    "y":           yj,
+                    "counts":      -A_j / n_tmpl,
+                    "psf_file":    tmpl.psf_files[j],
+                    "exptime":     tmpl.exptimes[j],
+                    "pixel_scale": tmpl.pixel_scales[j],
+                    "image_id":    tmpl.image_ids[j],
+                })
+
             # In ject the fake object into the current image frame
             new_img, inj_flux = self.psf_injector.inject(
                 image = dataset.images[i],
@@ -958,12 +1177,20 @@ class SyntheticTNOPipeline:
                 gain = dataset.gains[i],
                 pixel_scale = pscale,
                 psf_file = frame_psf,
-                debug_fake_only  = self.cfg["debug_fake_only"],
+                debug_fake_only = self.cfg["debug_fake_only"],
+                negative_wells = negative_wells,
+                add_noise_to_negative_wells =
+                    self.cfg.get("add_noise_to_negative_wells", False),
             )
+
             
             # Store the image with the fake object and measurements
             injected_images.append(new_img)
             injection_positions.append((x_inj, y_inj))
+            negative_positions.append([(w["x"], w["y"]) for w in negative_wells])
+            print("frame", i)
+            for w in negative_wells:
+                print(w["x"], w["y"], w["counts"], "tmpl", w["image_id"])
             injected_fluxes.append(inj_flux)
 
         # build tensor using the frame 0 reference pixel as the cutout centre
@@ -972,6 +1199,8 @@ class SyntheticTNOPipeline:
         if tensor is None:
             print(f"Cutout out of bounds.")
             return None
+
+        template_psf_files = [str(p) for p in tmpl.psf_files]
 
         #  metadata dictionary
         metadata = {
@@ -994,6 +1223,9 @@ class SyntheticTNOPipeline:
             "x_ref": x_ref,
             "y_ref": y_ref,
             "positions": np.array(injection_positions),
+            # negative wells (n_science_frames, n_template, 2)
+            "negative_positions": np.array(negative_positions),
+            "n_template": n_tmpl,
             # timing
             "mjds": np.array(dataset.mjds),
             "cent_times": np.array(dataset.cent_times),
@@ -1003,6 +1235,13 @@ class SyntheticTNOPipeline:
             "visit": self.cfg["visit"],
             "ccd": self.cfg["ccd"],
             "image_ids": np.array(dataset.image_ids),
+            # template info
+            "template_image_ids": np.array(tmpl.image_ids),
+            "template_zeropoints": np.array(tmpl.zeropoints),
+            "template_exptimes": np.array(tmpl.exptimes),
+            "template_cent_times": np.array(tmpl.cent_times),
+            "template_mjds": np.array(tmpl.mjds),
+            "template_psf_files": np.array(template_psf_files),
             "sample_idx": sample_idx,
             # debug
             "debug_fake_only": int(self.cfg["debug_fake_only"]),
@@ -1021,11 +1260,11 @@ class SyntheticTNOPipeline:
         if self.cfg["save_plots"]:
             out_png = self.out_dir / f"tensor_{run_label}.png"
             title_info = {
-                "ccd":   self.cfg["ccd"],
-                "mag":   mag,
-                "r":     orbit["r"],
+                "ccd": self.cfg["ccd"],
+                "mag": mag,
+                "r": orbit["r"],
                 "i_deg": orbit["i_deg"],
-                "rate":  motion["rate"],
+                "rate":motion["rate"],
                 "angle": motion["angle"],
             }
             self.plotter.save(
@@ -1035,6 +1274,8 @@ class SyntheticTNOPipeline:
                 dataset.image_ids,
                 dataset.cent_times,
                 title_info,
+                negative_positions,
+
             )
 
         return {
@@ -1063,6 +1304,7 @@ def main():
     print(f"  Visit:       {cfg['visit']}")
     print(f"  CCD:         {cfg['ccd']}")
     print(f"  PSF source:  dbimages (auto-lookup per frame)")
+    print(f"  Templates:   {cfg['visit']}_template_visit_list.txt")
     print(f"  Num samples: {cfg['num_samples']}")
     print(f"  Frames:      {cfg['n_frames']}")
     print(f"  Half-size:   {cfg['half_size']} px  "
